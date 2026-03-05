@@ -1,41 +1,32 @@
 # model_ticket_routing.py
-# Pyomo MILP model: technician scheduling with travel, hotel, SLA + "return to base if not redirected"
+# Pyomo MILP model: technician scheduling with travel, hotel, SLA
+# + ECONOMIC PENALTY for idle days away from base (no explicit "return-if-idle" constraint)
 #
-# Usage from a notebook (mani.ipynb):
+# Key change vs your version:
+# - Remove C18_return_if_idle_next
+# - Add idle_away[k,d] and penalize it in the objective.
+#   This makes “wait idle at a plant” expensive, so the model will *naturally*
+#   prefer returning to base (or otherwise staying productive) without forcing it.
+#
+# Usage:
 #   from model_ticket_routing import build_model
-#   data = {...}  # see template at bottom
 #   m = build_model(data)
-#   # solve with your solver of choice (gurobi/cbc/glpk)
+#   # solve with gurobi/cbc/glpk etc.
+#
+# Data dictionary keys (required/suggested):
+#   Sets:    B, K, P, T, D, M, N
+#   Params:  a, b, w, dur, node, base, dist, tt, EF, Hkp, c_hotel,
+#            X, alpha, beta, eta, gamma,
+#            (NEW) c_idle_away, delta
 
 from __future__ import annotations
 
-from typing import Dict, Any, Iterable, Tuple
+from typing import Dict, Any
 import pyomo.environ as pyo
 
 
 def build_model(data: Dict[str, Any]) -> pyo.ConcreteModel:
-    """
-    Build Pyomo model from a data dictionary.
-
-    Required keys in `data` (suggested):
-      Sets:
-        B, K, P, T, D, M, N
-      Params:
-        a, b, w, dur, node, base, dist, tt, EF, Hkp, c_hotel, X, alpha, beta, eta, gamma
-
-    Indexing conventions:
-      - a[t], b[t], w[t]            with t in T
-      - dur[t,k]                    with (t,k) in T x K
-      - node[t]                     with t in T (node in N)
-      - base[k]                     with k in K (base in B)
-      - dist[i,j]                   with (i,j) in N x N
-      - tt[i,j,m]                   with (i,j,m) in N x N x M
-      - EF[m]                       with m in M
-      - Hkp[k,p]                    with (k,p) in K x P
-      - c_hotel (scalar), X (int), alpha/beta/eta/gamma (scalar)
-    """
-
-    m = pyo.ConcreteModel(name="TechScheduling_Routing_ReturnToBase")
+    m = pyo.ConcreteModel(name="TechScheduling_Routing_EconIdlePenalty")
 
     # -------------------------
     # Sets
@@ -84,6 +75,12 @@ def build_model(data: Dict[str, Any]) -> pyo.ConcreteModel:
     m.eta = pyo.Param(within=pyo.NonNegativeReals, initialize=float(data["eta"]))
     m.gamma = pyo.Param(within=pyo.NonNegativeReals, initialize=float(data["gamma"]))
 
+    # NEW: cost and weight for idle-away days
+    # Interpret c_idle_away as "daily wage / opportunity cost" for being away and idle.
+    # If you prefer using only a weight, set c_idle_away=1 and tune delta.
+    m.c_idle_away = pyo.Param(within=pyo.NonNegativeReals, initialize=float(data.get("c_idle_away", 1.0)))
+    m.delta = pyo.Param(within=pyo.NonNegativeReals, initialize=float(data.get("delta", 0.0)))
+
     # Derived param: co2[i,j,m] = EF[m] * dist[i,j]
     def _co2_init(mm, i, j, md):
         return pyo.value(mm.EF[md]) * pyo.value(mm.dist[i, j])
@@ -93,93 +90,40 @@ def build_model(data: Dict[str, Any]) -> pyo.ConcreteModel:
     # -------------------------
     # Decision Variables
     # -------------------------
+    m.start = pyo.Var(m.T, m.K, m.D, domain=pyo.Binary)              # start[t,k,d]
+    m.z = pyo.Var(m.T, m.K, m.D, domain=pyo.Binary)                  # work day indicator
+    m.loc = pyo.Var(m.N, m.K, m.D, domain=pyo.Binary)                # location
+    m.y = pyo.Var(m.N, m.N, m.K, m.D, m.M, domain=pyo.Binary)        # travel arcs
+    m.away = pyo.Var(m.K, m.D, domain=pyo.Binary)                    # away from base
+    m.hotel = pyo.Var(m.K, m.D, domain=pyo.Binary)                   # hotel
+    m.C = pyo.Var(m.T, domain=pyo.NonNegativeReals)                  # completion day
+    m.L = pyo.Var(m.T, domain=pyo.NonNegativeReals)                  # lateness
+    m.busy = pyo.Var(m.K, m.D, domain=pyo.Binary)                    # any work or travel on day
 
-    # start[t,k,d] = 1 if technician k STARTS ticket t on day d
-    # Binary because a ticket either starts that day by that technician or not
-    # Index:
-    #   T = set of tickets
-    #   K = set of technicians
-    #   D = set of days
-    m.start = pyo.Var(m.T, m.K, m.D, domain=pyo.Binary)
-
-
-    # z[t,k,d] = 1 if technician k WORKS on ticket t on day d
-    # (useful when a ticket spans multiple days)
-    # Binary variable
-    m.z = pyo.Var(m.T, m.K, m.D, domain=pyo.Binary)
-
-
-    # loc[n,k,d] = 1 if technician k is physically located at node n on day d
-    # Node n can be:
-    #   - a plant
-    #   - a base
-    #   - a customer site
-    # Ensures location consistency in routing
-    m.loc = pyo.Var(m.N, m.K, m.D, domain=pyo.Binary)
-
-
-    # y[i,j,k,d,m] = 1 if technician k travels from node i to node j
-    # on day d during movement slot m
-    #
-    # Indices:
-    #   i,j ∈ N  → origin and destination nodes
-    #   k ∈ K    → technician
-    #   d ∈ D    → day
-    #   m ∈ M    → movement index within the day (to allow multiple trips per day)
-    #
-    # Binary routing variable
-    m.y = pyo.Var(m.N, m.N, m.K, m.D, m.M, domain=pyo.Binary)
-
-
-    # away[k,d] = 1 if technician k is away from their home base on day d
-    # Used for:
-    #   - cost calculation
-    #   - legal constraints (max consecutive days away)
-    #   - HR constraints
-    m.away = pyo.Var(m.K, m.D, domain=pyo.Binary)
-
-
-    # hotel[k,d] = 1 if technician k requires hotel accommodation on day d
-    # Typically linked to:
-    #   - distance from base
-    #   - late arrival
-    #   - multi-day assignment
-    m.hotel = pyo.Var(m.K, m.D, domain=pyo.Binary)
-
-
-    # C[t] = completion time (or completion day) of ticket t
-    # Continuous non-negative variable
-    # Used to compute SLA compliance or lateness
-    m.C = pyo.Var(m.T, domain=pyo.NonNegativeReals)
-
-
-    # L[t] = lateness of ticket t
-    # Continuous non-negative variable
-    # Typically:
-    #   L[t] ≥ C[t] - due_date[t]
-    m.L = pyo.Var(m.T, domain=pyo.NonNegativeReals)
-
-
-    # busy[k,d] = 1 if technician k performs any work on day d
-    # (at least one ticket assigned)
-    # Useful for:
-    #   - workload constraints
-    #   - max working days
-    #   - cost accounting
-    m.busy = pyo.Var(m.K, m.D, domain=pyo.Binary)
+    # NEW: idle-away indicator (away AND not busy)
+    m.idle_away = pyo.Var(m.K, m.D, domain=pyo.Binary)
 
     # -------------------------
     # Objective
     # -------------------------
     def obj_rule(mm):
+        # "work" term here is a proxy cost for consuming technician days;
+        # minimizing it tends to pick assignments with shorter durations.
         work = mm.alpha * sum(mm.z[t, k, d] for t in mm.T for k in mm.K for d in mm.D)
+
         travel = mm.beta * sum(
             mm.co2[i, j, md] * mm.y[i, j, k, d, md]
             for k in mm.K for d in mm.D for i in mm.N for j in mm.N for md in mm.M
         )
+
         hotel = mm.eta * sum(mm.c_hotel * mm.hotel[k, d] for k in mm.K for d in mm.D)
+
         sla = mm.gamma * sum(mm.w[t] * mm.L[t] for t in mm.T)
-        return work + travel + hotel + sla
+
+        # NEW: penalize idle days while away from home base
+        idle_away_cost = mm.delta * sum(mm.c_idle_away * mm.idle_away[k, d] for k in mm.K for d in mm.D)
+
+        return work + travel + hotel + sla + idle_away_cost
 
     m.OBJ = pyo.Objective(rule=obj_rule, sense=pyo.minimize)
 
@@ -193,7 +137,7 @@ def build_model(data: Dict[str, Any]) -> pyo.ConcreteModel:
 
     m.C1_start_once = pyo.Constraint(m.T, rule=c1_rule)
 
-    # (2) Start -> consecutive work: z[t,k,tau] = sum_{d covers tau} start[t,k,d]
+    # (2) Start -> consecutive work days
     def c2_rule(mm, t, k, tau):
         return mm.z[t, k, tau] == sum(
             mm.start[t, k, d]
@@ -203,7 +147,7 @@ def build_model(data: Dict[str, Any]) -> pyo.ConcreteModel:
 
     m.C2_consecutive_work = pyo.Constraint(m.T, m.K, m.D, rule=c2_rule)
 
-    # (3) Forbid start that would exceed horizon: start[t,k,d]=0 if d+dur-1>H
+    # (3) Forbid start that would exceed horizon
     def c3_rule(mm, t, k, d):
         if d + mm.dur[t, k] - 1 > mm.H:
             return mm.start[t, k, d] == 0
@@ -241,7 +185,7 @@ def build_model(data: Dict[str, Any]) -> pyo.ConcreteModel:
 
     m.C8_depart_if_there = pyo.Constraint(m.N, m.K, m.D, rule=c8_rule)
 
-    # (9) Atomic day: either work or travel (departure), not both
+    # (9) Atomic day: either work OR travel (departure), not both
     def c9_rule(mm, k, d):
         return (
             sum(mm.y[i, j, k, d, md] for i in mm.N for j in mm.N for md in mm.M)
@@ -251,7 +195,7 @@ def build_model(data: Dict[str, Any]) -> pyo.ConcreteModel:
 
     m.C9_atomic_day = pyo.Constraint(m.K, m.D, rule=c9_rule)
 
-    # (10) Arrival after travel time: loc[j,k,d+tt] >= y[i,j,k,d,m]
+    # (10) Arrival after travel time
     def c10_rule(mm, i, j, k, d, md):
         arr = d + mm.tt[i, j, md]
         if arr <= mm.H:
@@ -260,7 +204,7 @@ def build_model(data: Dict[str, Any]) -> pyo.ConcreteModel:
 
     m.C10_arrival = pyo.Constraint(m.N, m.N, m.K, m.D, m.M, rule=c10_rule)
 
-    # (11) Persistence if no departure from i on day d: loc[i,k,d+1] >= loc[i,k,d] - sum_{j,m} y[i,j,k,d,m]
+    # (11) Persistence lower bound (stay unless depart)
     def c11_rule(mm, i, k, d):
         if d < mm.H:
             return mm.loc[i, k, d + 1] >= mm.loc[i, k, d] - sum(
@@ -284,13 +228,13 @@ def build_model(data: Dict[str, Any]) -> pyo.ConcreteModel:
 
     m.C13_max_consecutive_away = pyo.Constraint(m.K, m.D, rule=c13_rule)
 
-    # (14) Hotel activation: hotel[k,d] >= sum_{p} Hkp[k,p]*loc[p,k,d]
+    # (14) Hotel activation
     def c14_rule(mm, k, d):
         return mm.hotel[k, d] >= sum(mm.Hkp[k, p] * mm.loc[p, k, d] for p in mm.P)
 
     m.C14_hotel = pyo.Constraint(m.K, m.D, rule=c14_rule)
 
-    # (15) Completion day: C[t] = sum_{k,d} (d + dur[t,k] - 1) * start[t,k,d]
+    # (15) Completion day
     def c15_rule(mm, t):
         return mm.C[t] == sum(
             (d + mm.dur[t, k] - 1) * mm.start[t, k, d]
@@ -300,80 +244,92 @@ def build_model(data: Dict[str, Any]) -> pyo.ConcreteModel:
 
     m.C15_completion = pyo.Constraint(m.T, rule=c15_rule)
 
-    # (16) Lateness: L[t] >= C[t] - b[t]
+    # (16) Lateness
     def c16_rule(mm, t):
         return mm.L[t] >= mm.C[t] - mm.b[t]
 
     m.C16_lateness = pyo.Constraint(m.T, rule=c16_rule)
 
-    # (17) L[t] >= 0 already by domain; keep if you want explicit:
+    # (17) L[t] >= 0 (explicit)
     def c17_rule(mm, t):
         return mm.L[t] >= 0
 
     m.C17_lateness_nonneg = pyo.Constraint(m.T, rule=c17_rule)
 
-    # (18) Return-to-base departure if not redirected (coherent with atomic day & tt)
-    # If at plant p on day d, and day d+1 would be idle, then on day d+1 must depart to base
-    # (or already be at base at start of day d+1).
-    def busy_lb_rule(mm, k, d):
+    # -------------------------
+    # Busy definition (kept)
+    # -------------------------
+    def busy_lb_work(mm, k, d):
         return mm.busy[k, d] >= sum(mm.z[t, k, d] for t in mm.T)
-    m.BUSY_LB1 = pyo.Constraint(m.K, m.D, rule=busy_lb_rule)
 
-    def busy_lb2_rule(mm, k, d):
+    m.BUSY_LB_WORK = pyo.Constraint(m.K, m.D, rule=busy_lb_work)
+
+    def busy_lb_travel(mm, k, d):
         return mm.busy[k, d] >= sum(mm.y[i, j, k, d, md] for i in mm.N for j in mm.N for md in mm.M)
-    m.BUSY_LB2 = pyo.Constraint(m.K, m.D, rule=busy_lb2_rule)
 
-    def busy_ub_rule(mm, k, d):
+    m.BUSY_LB_TRAVEL = pyo.Constraint(m.K, m.D, rule=busy_lb_travel)
+
+    def busy_ub(mm, k, d):
         return mm.busy[k, d] <= (
             sum(mm.z[t, k, d] for t in mm.T)
             + sum(mm.y[i, j, k, d, md] for i in mm.N for j in mm.N for md in mm.M)
         )
-    m.BUSY_UB = pyo.Constraint(m.K, m.D, rule=busy_ub_rule)
-    
-    def c18_rule_fixed(mm, k, d, p):
-        if d < mm.H:
-            base = mm.base[k]
-            depart_to_base = sum(mm.y[p, base, k, d + 1, md] for md in mm.M)
-            return mm.loc[p, k, d] <= mm.busy[k, d + 1] + mm.loc[base, k, d + 1] + depart_to_base
-        return pyo.Constraint.Skip
 
-    m.C18_return_if_idle_next = pyo.Constraint(m.K, m.D, m.P, rule=c18_rule_fixed)
+    m.BUSY_UB = pyo.Constraint(m.K, m.D, rule=busy_ub)
+
+    # -------------------------
+    # NEW: idle-away linking constraints
+    # idle_away = 1 iff (away == 1 and busy == 0)
+    # -------------------------
+    def idle_away_lb(mm, k, d):
+        # if away=1 and busy=0 => idle_away must be 1
+        return mm.idle_away[k, d] >= mm.away[k, d] - mm.busy[k, d]
+
+    m.IDLE_AWAY_LB = pyo.Constraint(m.K, m.D, rule=idle_away_lb)
+
+    def idle_away_ub1(mm, k, d):
+        return mm.idle_away[k, d] <= mm.away[k, d]
+
+    m.IDLE_AWAY_UB1 = pyo.Constraint(m.K, m.D, rule=idle_away_ub1)
+
+    def idle_away_ub2(mm, k, d):
+        return mm.idle_away[k, d] <= 1 - mm.busy[k, d]
+
+    m.IDLE_AWAY_UB2 = pyo.Constraint(m.K, m.D, rule=idle_away_ub2)
 
     # -------------------------
     # Fixes: prevent teleportation + forbid moving to other bases
     # -------------------------
 
-    # (A) Forbid self-loop travel y[i,i,*,*,*] (prevents "fake travel" that breaks persistence)
+    # (A) Forbid self-loop travel
     def cA_no_self_loop(mm, i, k, d, md):
         return mm.y[i, i, k, d, md] == 0
+
     m.CA_no_self_loop = pyo.Constraint(m.N, m.K, m.D, m.M, rule=cA_no_self_loop)
 
     # (B) Forbid being located at bases other than technician's own base
-    #     i.e., loc[b,k,d] = 0 for all base nodes b != base[k]
     def cB_no_other_bases(mm, b, k, d):
         if b != mm.base[k]:
             return mm.loc[b, k, d] == 0
         return pyo.Constraint.Skip
+
     m.CB_no_other_bases = pyo.Constraint(m.B, m.K, m.D, rule=cB_no_other_bases)
 
-    # (C) Forbid traveling to/from other bases as well (tightens the model)
-    def cC_no_travel_from_other_bases(mm, i, j, k, d, md):
-        # if i is a base but not own base -> forbid
+    # (C) Forbid traveling to/from other bases
+    def cC_no_travel_other_bases(mm, i, j, k, d, md):
         if (i in mm.B) and (i != mm.base[k]):
             return mm.y[i, j, k, d, md] == 0
-        # if j is a base but not own base -> forbid
         if (j in mm.B) and (j != mm.base[k]):
             return mm.y[i, j, k, d, md] == 0
         return pyo.Constraint.Skip
-    m.CC_no_travel_other_bases = pyo.Constraint(m.N, m.N, m.K, m.D, m.M, rule=cC_no_travel_from_other_bases)
 
-    # Helper expressions: departures from a node on a day, arrivals to a node on a day
+    m.CC_no_travel_other_bases = pyo.Constraint(m.N, m.N, m.K, m.D, m.M, rule=cC_no_travel_other_bases)
+
+    # Helper expressions: departures and arrivals-on-day
     def dep_from(mm, j, k, d):
         return sum(mm.y[j, h, k, d, md] for h in mm.N for md in mm.M)
 
     def arr_to_on_day(mm, j, k, d):
-        # sum of all departures (i -> j) that arrive exactly on day d
-        # i.e., d0 + tt[i,j,md] == d
         return sum(
             mm.y[i, j, k, d0, md]
             for i in mm.N
@@ -382,12 +338,7 @@ def build_model(data: Dict[str, Any]) -> pyo.ConcreteModel:
             if d0 + mm.tt[i, j, md] == d
         )
 
-    # (D) No-teleport upper bound:
-    #     loc[j,k,d] can be 1 only if:
-    #       - stayed from yesterday without departing from j, OR
-    #       - arrived to j exactly on day d
-    #
-    # This complements your existing lower bound persistence (C11) and arrival lower bounds (C10).
+    # (D) No-teleport upper bound (flow UB)
     def cD_flow_ub(mm, j, k, d):
         if d == 1:
             return pyo.Constraint.Skip
